@@ -219,7 +219,7 @@ import * as CANNON from 'cannon-es';
    WebAR Scene Generator — Three.js r185 / WebXR Depth API
    ------------------------------------------------------------
    · Hit-Test     : 平面検出 & リング表示 (requiredFeatures)
-   · Depth API    : GPU-optimized depth → Three.js 組み込みオクルージョン
+   · Depth API    : XRWebGLBinding + カスタムシェーダー GPU オクルージョン (Pixel 7a)
    · Physics      : cannon-es 重力・衝突・積み重ね
    · AI           : TensorFlow.js COCO-SSD (端末内推論)
    · Hosting      : 単一 HTML + CDN (GitHub Pages 対応)
@@ -285,12 +285,18 @@ function initPhysics() {
 }
 
 /* ---- Depth-sensing (GPU occlusion) state ---- */
-/* Three.js r185 の WebXRManager が depth-sensing テクスチャを取得し、
-   レンダリング前に深度バッファへ書き込む。配置オブジェクトは通常の
-   depthTest で実世界に自然に隠れる (Pixel 7a 等 ARCore 端末)。       */
+/* Pixel 7a 等 ARCore 端末向け:
+   Three.js 組み込み depth mesh (sampler2DArray) は単眼 AR で効かないことがあるため、
+   XRWebGLBinding.getDepthInformation() + カスタムシェーダーで GPU オクルージョンを行う。
+   深度 UV は normDepthBufferFromNormView 行列で変換 (W3C WebXR Depth Sensing 準拠)。 */
 const depthState = {
-  enabled: false,   // hasDepthSensing() が true になったら ON
-  notified: false,  // HUD へ一度だけ通知済みか
+  enabled: false,
+  notified: false,
+  lastGlTex: null,
+  threeDepthTexture: null,
+  uvMatrix: null,
+  rawValueToMeters: 0.001,
+  isFloatFormat: false,
 };
 
 function initThree() {
@@ -336,8 +342,43 @@ function initThree() {
 }
 
 /* ============================================================
-   XR SESSION
+   XR SESSION — Hit-Test 必須 / Depth API (Pixel 7a 向け)
 ============================================================ */
+async function requestARSession() {
+  /* depth-sensing を required で試行 → 失敗時は optional にフォールバック */
+  const configs = [
+    {
+      requiredFeatures: ['hit-test', 'depth-sensing'],
+      optionalFeatures: ['dom-overlay'],
+      depthSensing: {
+        usagePreference: ['gpu-optimized'],
+        dataFormatPreference: ['luminance-alpha'],
+      },
+      domOverlay: { root: document.body },
+    },
+    {
+      requiredFeatures: ['hit-test'],
+      optionalFeatures: ['dom-overlay', 'depth-sensing'],
+      depthSensing: {
+        usagePreference: ['gpu-optimized'],
+        dataFormatPreference: ['luminance-alpha', 'float32'],
+      },
+      domOverlay: { root: document.body },
+    },
+  ];
+
+  let lastErr;
+  for (const cfg of configs) {
+    try {
+      return await navigator.xr.requestSession('immersive-ar', cfg);
+    } catch (e) {
+      lastErr = e;
+      console.warn('AR session config failed, trying fallback:', e.message);
+    }
+  }
+  throw lastErr || new Error('ARセッションを開始できませんでした');
+}
+
 async function startAR() {
   if (!navigator.xr) {
     el.notSupported.style.display = 'flex';
@@ -350,16 +391,7 @@ async function startAR() {
   }
 
   try {
-    /* Hit-Test は必須。Depth API / DOM Overlay は optional (Pixel 7a 等で自動有効化) */
-    const session = await navigator.xr.requestSession('immersive-ar', {
-      requiredFeatures: ['hit-test'],
-      optionalFeatures: ['dom-overlay', 'depth-sensing'],
-      depthSensing: {
-        usagePreference: ['gpu-optimized'],              // GPU 深度テクスチャ (Pixel ARCore)
-        dataFormatPreference: ['luminance-alpha', 'float32'],
-      },
-      domOverlay: { root: document.body },
-    });
+    const session = await requestARSession();
     state.session = session;
 
     el.startOverlay.style.display = 'none';
@@ -372,10 +404,19 @@ async function startAR() {
     const viewerSpace = await session.requestReferenceSpace('viewer');
     state.hitTestSource = await session.requestHitTestSource({ space: viewerSpace });
 
-    /* Depth API: Three.js r185 が session 内で getDepthInformation() を処理。
-       有効化は最初のフレームで renderer.xr.hasDepthSensing() を確認する。 */
+    /* Depth API 初期化 — 実際の有効化は onXRFrame で getDepthInformation() を確認 */
     depthState.enabled = false;
     depthState.notified = false;
+    depthState.lastGlTex = null;
+    depthState.threeDepthTexture = null;
+    depthState.isFloatFormat = session.preferredDepthFormat === 'float32';
+
+    if (session.enabledFeatures?.includes('depth-sensing')) {
+      console.info('[Depth] feature enabled, usage:', session.depthUsage, 'format:', session.preferredDepthFormat);
+    } else {
+      console.warn('[Depth] depth-sensing not in enabledFeatures — occlusion disabled');
+      showError('この端末/ブラウザでは Depth API が無効です(物理のみ動作)');
+    }
 
     session.addEventListener('end', onSessionEnd);
     setStatus('平面を探しています…', '');
@@ -392,6 +433,8 @@ function onSessionEnd() {
   state.hitTestSource = null;
   depthState.enabled = false;
   depthState.notified = false;
+  depthState.lastGlTex = null;
+  depthState.threeDepthTexture = null;
   el.hud.style.display = 'none';
   el.startOverlay.style.display = 'flex';
   // clear placed objects
@@ -489,18 +532,136 @@ function addPhysicsBodyForGroup(group, spec, dropHeight = 0.15) {
 }
 
 /* ============================================================
+   GPU DEPTH OCCLUSION — カスタムシェーダー (Pixel 7a / ARCore 向け)
+   W3C WebXR Depth Sensing: normDepthBufferFromNormView + luminance-alpha
+============================================================ */
+const occlusionPatchedMaterials = new WeakSet();
+
+function patchMaterialForOcclusion(material) {
+  if (occlusionPatchedMaterials.has(material)) return;
+  occlusionPatchedMaterials.add(material);
+
+  material.onBeforeCompile = (shader) => {
+    shader.uniforms.uDepthTexture = { value: null };
+    shader.uniforms.uUvTransform = { value: new THREE.Matrix4() };
+    shader.uniforms.uRawValueToMeters = { value: 0.001 };
+    shader.uniforms.uDepthIsFloat = { value: 0.0 };
+
+    shader.fragmentShader = `
+      uniform sampler2D uDepthTexture;
+      uniform mat4 uUvTransform;
+      uniform float uRawValueToMeters;
+      uniform float uDepthIsFloat;
+      ${shader.fragmentShader}
+    `;
+
+    /* vViewPosition は MeshStandardMaterial 標準 varying — ビュー空間深度比較に使用 */
+    shader.fragmentShader = shader.fragmentShader.replace(
+      '#include <dithering_fragment>',
+      `
+      #include <dithering_fragment>
+      {
+        vec2 normViewXY = vViewPosition.xy / vViewPosition.z;
+        vec2 depthUV = (uUvTransform * vec4(normViewXY, 0.0, 1.0)).xy;
+        float envDepthM;
+        if (uDepthIsFloat > 0.5) {
+          envDepthM = texture2D(uDepthTexture, depthUV).r * uRawValueToMeters;
+        } else {
+          vec2 packed = texture2D(uDepthTexture, depthUV).ra;
+          envDepthM = dot(packed, vec2(255.0, 256.0 * 255.0)) * uRawValueToMeters;
+        }
+        float fragDepthM = -vViewPosition.z;
+        if (envDepthM > 0.01 && fragDepthM > envDepthM + 0.015) {
+          discard;
+        }
+      }
+      `
+    );
+
+    material.userData.shaderRef = shader;
+  };
+  material.needsUpdate = true;
+}
+
+function patchOcclusionOnGroup(group) {
+  group.traverse((node) => {
+    if (!node.isMesh || !node.material) return;
+    const mats = Array.isArray(node.material) ? node.material : [node.material];
+    mats.forEach(patchMaterialForOcclusion);
+  });
+}
+
+function applyDepthUniformsToPlacedObjects(depthTexture, uvMatrix, rawValueToMeters, isFloatFormat) {
+  placedObjects.forEach((group) => {
+    group.traverse((node) => {
+      if (!node.isMesh || !node.material) return;
+      const mats = Array.isArray(node.material) ? node.material : [node.material];
+      mats.forEach((mat) => {
+        patchMaterialForOcclusion(mat);
+        const shader = mat.userData.shaderRef;
+        if (shader) {
+          shader.uniforms.uDepthTexture.value = depthTexture;
+          shader.uniforms.uUvTransform.value.copy(uvMatrix);
+          shader.uniforms.uRawValueToMeters.value = rawValueToMeters;
+          shader.uniforms.uDepthIsFloat.value = isFloatFormat ? 1.0 : 0.0;
+        }
+      });
+    });
+  });
+}
+
+/** 毎フレーム GPU 深度テクスチャを取得し配置オブジェクトへ適用 */
+function updateDepthOcclusion(frame, refSpace) {
+  const session = state.session;
+  if (!session?.enabledFeatures?.includes('depth-sensing')) return false;
+  if (session.depthUsage !== 'gpu-optimized') return false;
+
+  const binding = renderer.xr.getBinding();
+  if (!binding?.getDepthInformation) return false;
+
+  const pose = frame.getViewerPose(refSpace);
+  if (!pose) return false;
+
+  for (const view of pose.views) {
+    let depthInfo;
+    try {
+      depthInfo = binding.getDepthInformation(view);
+    } catch (e) {
+      console.warn('[Depth] getDepthInformation failed:', e.message);
+      return false;
+    }
+    if (!depthInfo || !depthInfo.isValid || !depthInfo.texture) continue;
+
+    if (depthState.lastGlTex !== depthInfo.texture) {
+      depthState.threeDepthTexture = new THREE.ExternalTexture(depthInfo.texture);
+      depthState.lastGlTex = depthInfo.texture;
+    }
+    if (!depthState.uvMatrix) depthState.uvMatrix = new THREE.Matrix4();
+    depthState.uvMatrix.fromArray(depthInfo.normDepthBufferFromNormView.matrix);
+    depthState.rawValueToMeters = depthInfo.rawValueToMeters || 0.001;
+
+    applyDepthUniformsToPlacedObjects(
+      depthState.threeDepthTexture,
+      depthState.uvMatrix,
+      depthState.rawValueToMeters,
+      depthState.isFloatFormat
+    );
+    return true;
+  }
+  return false;
+}
+
+/* ============================================================
    XR FRAME LOOP — Hit-Test / Physics / GPU Depth Occlusion
-   Three.js r185: renderer.render() 内で WebXRDepthSensing が
-   実環境の深度をフレームバッファに書き込み、配置オブジェクトは
-   通常の depthTest により自動オクルージョンされる。
 ============================================================ */
 function onXRFrame(timestamp, frame) {
   if (!frame) return;
   const refSpace = renderer.xr.getReferenceSpace();
   const dt = clockDelta();
 
-  // --- GPU Depth Occlusion 状態を初回検出 (Pixel 7a 等) ---
-  if (!depthState.notified && renderer.xr.hasDepthSensing()) {
+  // --- GPU Depth Occlusion: getDepthInformation() で深度テクスチャ取得 ---
+  const depthOk = updateDepthOcclusion(frame, refSpace);
+  if (depthOk && !depthState.notified) {
     depthState.enabled = true;
     depthState.notified = true;
     if (state.reticleVisible) {
@@ -544,7 +705,7 @@ function onXRFrame(timestamp, frame) {
     }
   }
 
-  // renderer.render() が WebXR Depth Sensing メッシュを先に描画し GPU オクルージョンを適用
+  // カスタムシェーダーで GPU オクルージョン適用済み — render で描画
   renderer.render(scene, camera);
 }
 
@@ -905,6 +1066,9 @@ function placeObject(spec, matrixArray) {
   group.position.copy(pos);
   scene.add(group);
   placedObjects.push(group);
+
+  // GPU Depth Occlusion 用シェーダーパッチを全メッシュに適用
+  patchOcclusionOnGroup(group);
 
   // Ensure there is a static floor/table collider at this spot so the
   // object (and future objects) can land on it and stack up.
