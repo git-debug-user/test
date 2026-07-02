@@ -149,8 +149,17 @@
 </style>
 <!-- ローカル(ブラウザ内)画像認識用: TensorFlow.js + COCO-SSD          -->
 <!-- APIキー不要。すべての推論はこの端末上で完結し、外部送信は一切ない -->
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<!-- GitHub Pages 向け import map (Three.js r185 + cannon-es)           -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.185.1/build/three.module.js",
+    "cannon-es": "https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js"
+  }
+}
+</script>
 </head>
 <body>
 
@@ -159,10 +168,10 @@
 <!-- Start Screen -->
 <div id="start-overlay">
   <h1>WebAR SCENE GENERATOR</h1>
-  <p>カメラでその場を撮影すると、AIがシーンを認識し、状況に合った3Dオブジェクトをその場に自動生成して配置します。重力で落下・積み重ねが反映され、対応端末では実物の陰に自然に隠れます(オクルージョン)。</p>
+  <p>カメラでその場を撮影すると、AIがシーンを認識し、状況に合った3Dオブジェクトをその場に自動生成して配置します。重力で落下・積み重ねが反映され、Pixel 7a 等の対応端末では WebXR Depth API による GPU オクルージョンで実物の陰に自然に隠れます。</p>
 
   <button id="start-btn" class="glow-btn" disabled>AIモデルを読み込み中…</button>
-  <div id="compat-note">※ WebXR Hit-Test 対応の Android Chrome 推奨。iOS Safari は非対応です。<br>※ オクルージョン(Depth API)は対応端末(Pixel等の一部)のみ有効になります。非対応機種では物理(重力・積み重ね)のみ動作します。<br>※ 画像認識はすべて端末内(ブラウザ)で実行されます。APIキーや通信は不要です。</div>
+  <div id="compat-note">※ WebXR Hit-Test 対応の Android Chrome 最新版推奨(Pixel 7a 等)。iOS Safari は非対応です。<br>※ GPU Depth Occlusion(WebXR Depth API)は ARCore 対応端末(Pixel 7a/7/8 等)のみ有効。非対応機種では物理(重力・積み重ね)のみ動作します。<br>※ 画像認識はすべて端末内(ブラウザ)で実行されます。APIキーや通信は不要です。</div>
 </div>
 
 <!-- Not supported fallback -->
@@ -203,8 +212,18 @@
 </div>
 
 <script type="module">
-import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
-import * as CANNON from 'https://unpkg.com/cannon-es@0.20.0/dist/cannon-es.js';
+import * as THREE from 'three';
+import * as CANNON from 'cannon-es';
+
+/* ============================================================
+   WebAR Scene Generator — Three.js r185 / WebXR Depth API
+   ------------------------------------------------------------
+   · Hit-Test     : 平面検出 & リング表示 (requiredFeatures)
+   · Depth API    : GPU-optimized depth → Three.js 組み込みオクルージョン
+   · Physics      : cannon-es 重力・衝突・積み重ね
+   · AI           : TensorFlow.js COCO-SSD (端末内推論)
+   · Hosting      : 単一 HTML + CDN (GitHub Pages 対応)
+============================================================ */
 
 /* ============================================================
    STATE
@@ -265,11 +284,13 @@ function initPhysics() {
   physicsWorld.solver.iterations = 8;
 }
 
-/* ---- Depth-sensing (occlusion) state ---- */
+/* ---- Depth-sensing (GPU occlusion) state ---- */
+/* Three.js r185 の WebXRManager が depth-sensing テクスチャを取得し、
+   レンダリング前に深度バッファへ書き込む。配置オブジェクトは通常の
+   depthTest で実世界に自然に隠れる (Pixel 7a 等 ARCore 端末)。       */
 const depthState = {
-  enabled: false,
-  glBinding: null,
-  supported: null, // null = unknown, true/false after first attempt
+  enabled: false,   // hasDepthSensing() が true になったら ON
+  notified: false,  // HUD へ一度だけ通知済みか
 };
 
 function initThree() {
@@ -279,7 +300,7 @@ function initThree() {
   renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
   renderer.setPixelRatio(window.devicePixelRatio);
   renderer.setSize(window.innerWidth, window.innerHeight);
-  renderer.xr.enabled = true;
+  renderer.xr.enabled = true; // WebXR AR セッションを有効化
   document.getElementById('app').appendChild(renderer.domElement);
 
   initPhysics();
@@ -291,17 +312,22 @@ function initThree() {
   dir.position.set(1, 2, 1);
   scene.add(dir);
 
-  // Reticle (placement indicator)
+  // Reticle (placement indicator) — depthTest 無効で常に前面表示
   const ringGeo = new THREE.RingGeometry(0.07, 0.09, 32).rotateX(-Math.PI / 2);
-  const ringMat = new THREE.MeshBasicMaterial({ color: 0x00f0c0, side: THREE.DoubleSide, transparent: true, opacity: 0.9 });
+  const ringMat = new THREE.MeshBasicMaterial({
+    color: 0x00f0c0, side: THREE.DoubleSide, transparent: true, opacity: 0.9,
+    depthTest: false, depthWrite: false,
+  });
   reticle = new THREE.Mesh(ringGeo, ringMat);
   reticle.matrixAutoUpdate = false;
   reticle.visible = false;
+  reticle.renderOrder = 999; // 深度オクルージョンより手前に描画
   scene.add(reticle);
 
-  // small inner dot
+  // 内側ドット
   const dotGeo = new THREE.CircleGeometry(0.015, 16).rotateX(-Math.PI / 2);
-  const dot = new THREE.Mesh(dotGeo, new THREE.MeshBasicMaterial({ color: 0x00f0c0 }));
+  const dotMat = new THREE.MeshBasicMaterial({ color: 0x00f0c0, depthTest: false, depthWrite: false });
+  const dot = new THREE.Mesh(dotGeo, dotMat);
   reticle.add(dot);
 
   window.addEventListener('resize', () => {
@@ -324,11 +350,12 @@ async function startAR() {
   }
 
   try {
+    /* Hit-Test は必須。Depth API / DOM Overlay は optional (Pixel 7a 等で自動有効化) */
     const session = await navigator.xr.requestSession('immersive-ar', {
       requiredFeatures: ['hit-test'],
       optionalFeatures: ['dom-overlay', 'depth-sensing'],
       depthSensing: {
-        usagePreference: ['gpu-optimized', 'cpu-optimized'],
+        usagePreference: ['gpu-optimized'],              // GPU 深度テクスチャ (Pixel ARCore)
         dataFormatPreference: ['luminance-alpha', 'float32'],
       },
       domOverlay: { root: document.body },
@@ -345,26 +372,13 @@ async function startAR() {
     const viewerSpace = await session.requestReferenceSpace('viewer');
     state.hitTestSource = await session.requestHitTestSource({ space: viewerSpace });
 
-    // --- Depth API setup (best-effort; not all devices support it) ---
-    if (session.enabledFeatures && session.enabledFeatures.includes('depth-sensing')) {
-      try {
-        const gl = renderer.getContext();
-        depthState.glBinding = new XRWebGLBinding(session, gl);
-        depthState.supported = true;
-        depthState.enabled = true;
-        setStatus('オクルージョン対応端末を検出', 'ready');
-      } catch (e) {
-        console.warn('Depth API binding failed:', e);
-        depthState.supported = false;
-        depthState.enabled = false;
-      }
-    } else {
-      depthState.supported = false;
-      depthState.enabled = false;
-    }
+    /* Depth API: Three.js r185 が session 内で getDepthInformation() を処理。
+       有効化は最初のフレームで renderer.xr.hasDepthSensing() を確認する。 */
+    depthState.enabled = false;
+    depthState.notified = false;
 
     session.addEventListener('end', onSessionEnd);
-    setStatus(depthState.enabled ? '平面を探しています…(オクルージョンON)' : '平面を探しています…', '');
+    setStatus('平面を探しています…', '');
     renderer.setAnimationLoop(onXRFrame);
   } catch (err) {
     console.error(err);
@@ -377,7 +391,7 @@ function onSessionEnd() {
   state.session = null;
   state.hitTestSource = null;
   depthState.enabled = false;
-  depthState.glBinding = null;
+  depthState.notified = false;
   el.hud.style.display = 'none';
   el.startOverlay.style.display = 'flex';
   // clear placed objects
@@ -475,90 +489,26 @@ function addPhysicsBodyForGroup(group, spec, dropHeight = 0.15) {
 }
 
 /* ============================================================
-   DEPTH-SENSING OCCLUSION
-   Approach: for each placed object's material, inject a fragment-shader
-   snippet that compares the fragment's view-space depth against the
-   real-world depth texture provided by the WebXR Depth API. If the real
-   world is closer, discard the fragment (so the real object "wins" and
-   the virtual object appears hidden behind it).
+   XR FRAME LOOP — Hit-Test / Physics / GPU Depth Occlusion
+   Three.js r185: renderer.render() 内で WebXRDepthSensing が
+   実環境の深度をフレームバッファに書き込み、配置オブジェクトは
+   通常の depthTest により自動オクルージョンされる。
 ============================================================ */
-const occlusionPatchedMaterials = new WeakSet();
-
-function patchMaterialForOcclusion(material) {
-  if (occlusionPatchedMaterials.has(material)) return;
-  occlusionPatchedMaterials.add(material);
-
-  material.onBeforeCompile = (shader) => {
-    shader.uniforms.uDepthTexture = { value: null };
-    shader.uniforms.uResolution = { value: new THREE.Vector2(1, 1) };
-    shader.uniforms.uRawValueToMeters = { value: 0.001 };
-
-    shader.fragmentShader = `
-      uniform sampler2D uDepthTexture;
-      uniform vec2 uResolution;
-      uniform float uRawValueToMeters;
-      ${shader.fragmentShader}
-    `;
-
-    shader.fragmentShader = shader.fragmentShader.replace(
-      '#include <dithering_fragment>',
-      `
-      #include <dithering_fragment>
-      {
-        vec2 screenUv = gl_FragCoord.xy / uResolution;
-        vec4 depthSample = texture2D(uDepthTexture, screenUv);
-        float rawDepth = depthSample.r + depthSample.g / 256.0;
-        float realWorldDepthM = rawDepth * uRawValueToMeters * 255.0;
-        float fragDepthM = -vViewPosition.z;
-        if (realWorldDepthM > 0.05 && fragDepthM > realWorldDepthM) {
-          discard;
-        }
-      }
-      `
-    );
-
-    material.userData.shaderRef = shader;
-  };
-  material.needsUpdate = true;
-}
-
-function applyDepthTextureToMaterials(depthInfo, view) {
-  if (!depthInfo || !depthInfo.texture) return;
-
-  // Lazily wrap the GPU depth texture handle so Three's uniform system
-  // can reference it. (Best-effort integration: Three.js r160 does not
-  // ship a first-class WebXR depth texture wrapper, so we attach the
-  // raw WebGLTexture handle directly.)
-  if (depthState._lastGlTex !== depthInfo.texture) {
-    const tex = new THREE.Texture();
-    tex.__webglTexture = depthInfo.texture;
-    tex.isDepthTexture = true;
-    depthState._threeDepthTexture = tex;
-    depthState._lastGlTex = depthInfo.texture;
-  }
-
-  const width = renderer.domElement.width;
-  const height = renderer.domElement.height;
-
-  placedObjects.forEach((group) => {
-    group.traverse((node) => {
-      if (node.isMesh && node.material) {
-        patchMaterialForOcclusion(node.material);
-        const shader = node.material.userData.shaderRef;
-        if (shader) {
-          shader.uniforms.uDepthTexture.value = depthState._threeDepthTexture;
-          shader.uniforms.uResolution.value.set(width, height);
-          shader.uniforms.uRawValueToMeters.value = depthInfo.rawValueToMeters || 0.001;
-        }
-      }
-    });
-  });
-}
-
 function onXRFrame(timestamp, frame) {
   if (!frame) return;
   const refSpace = renderer.xr.getReferenceSpace();
   const dt = clockDelta();
+
+  // --- GPU Depth Occlusion 状態を初回検出 (Pixel 7a 等) ---
+  if (!depthState.notified && renderer.xr.hasDepthSensing()) {
+    depthState.enabled = true;
+    depthState.notified = true;
+    if (state.reticleVisible) {
+      setStatus('平面検出 OK — GPUオクルージョン ON', 'ready');
+    } else {
+      setStatus('平面を探しています…(GPUオクルージョン ON)', '');
+    }
+  }
 
   // --- Physics step ---
   if (physicsWorld) {
@@ -566,25 +516,7 @@ function onXRFrame(timestamp, frame) {
     syncMeshesToPhysics();
   }
 
-  // --- Depth-sensing: fetch per-frame depth info for occlusion ---
-  if (depthState.enabled && depthState.glBinding) {
-    try {
-      const viewerPose = frame.getViewerPose(refSpace);
-      if (viewerPose) {
-        for (const view of viewerPose.views) {
-          const gpuDepth = depthState.glBinding.getDepthInformation
-            ? depthState.glBinding.getDepthInformation(view)
-            : null;
-          if (gpuDepth) {
-            applyDepthTextureToMaterials(gpuDepth, view);
-          }
-        }
-      }
-    } catch (e) {
-      // Depth not available this frame; ignore and continue without occlusion this tick
-    }
-  }
-
+  // --- Hit-Test: 平面検出 & リング表示 ---
   if (state.hitTestSource) {
     const hitResults = frame.getHitTestResults(state.hitTestSource);
     if (hitResults.length > 0) {
@@ -594,7 +526,8 @@ function onXRFrame(timestamp, frame) {
       state.lastReticlePose = pose;
       if (!state.reticleVisible) {
         state.reticleVisible = true;
-        setStatus('平面検出 OK — シャッターでスキャン', 'ready');
+        const depthLabel = depthState.enabled ? ' — GPUオクルージョン ON' : '';
+        setStatus(`平面検出 OK — シャッターでスキャン${depthLabel}`, 'ready');
         el.reticleLabel.textContent = 'タップしてその場をスキャン';
         el.shutter.classList.remove('disabled');
       }
@@ -603,13 +536,15 @@ function onXRFrame(timestamp, frame) {
       state.lastReticlePose = null;
       if (state.reticleVisible) {
         state.reticleVisible = false;
-        setStatus('平面を探しています…', '');
+        const depthLabel = depthState.enabled ? '(GPUオクルージョン ON) ' : '';
+        setStatus(`${depthLabel}平面を探しています…`, '');
         el.reticleLabel.textContent = '床や机にカメラを向けてください';
         el.shutter.classList.add('disabled');
       }
     }
   }
 
+  // renderer.render() が WebXR Depth Sensing メッシュを先に描画し GPU オクルージョンを適用
   renderer.render(scene, camera);
 }
 
@@ -764,8 +699,15 @@ function buildObjectFromSpec(spec) {
   const primary = new THREE.Color(colorOrFallback(spec.primary_color, '#00f0c0'));
   const secondary = new THREE.Color(colorOrFallback(spec.secondary_color, '#0a2a26'));
 
-  const matPrimary = new THREE.MeshStandardMaterial({ color: primary, roughness: 0.35, metalness: 0.25, emissive: primary, emissiveIntensity: 0.12 });
-  const matSecondary = new THREE.MeshStandardMaterial({ color: secondary, roughness: 0.6, metalness: 0.1 });
+  const matPrimary = new THREE.MeshStandardMaterial({
+    color: primary, roughness: 0.35, metalness: 0.25,
+    emissive: primary, emissiveIntensity: 0.12,
+    depthTest: true, depthWrite: true, // GPU Depth Occlusion 対象
+  });
+  const matSecondary = new THREE.MeshStandardMaterial({
+    color: secondary, roughness: 0.6, metalness: 0.1,
+    depthTest: true, depthWrite: true,
+  });
 
   switch (spec.object_type) {
     case 'creature': {
