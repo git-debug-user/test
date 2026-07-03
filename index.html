@@ -1154,6 +1154,8 @@ if (!navigator.xr) {
     el.startBtn.disabled = false;
     el.startBtn.textContent = 'ARを開始';
   } catch (err) {
+    //error info
+    alert(err.name + "\n" + err.message);
     console.error(err);
     el.startBtn.textContent = 'モデル読み込み失敗(再読み込みしてください)';
     showError(err.message || 'AIモデルの読み込みに失敗しました');
