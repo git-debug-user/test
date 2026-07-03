@@ -133,6 +133,7 @@ const ctx = {
   get physicsWorld() { return physicsWorld; },
   placedObjects, physicsBodies, planeColliders,
   depthState: null, // startAR() 内で生成
+  xrGlBinding: null, // startAR() 内で `new XRWebGLBinding(session, gl)` として自前生成
 };
 
 /* ============================================================

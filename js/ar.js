@@ -123,6 +123,7 @@ export async function startAR(ctx) {
     state.session = session;
 
     ctx.depthState = createDepthState();
+    ctx.xrGlBinding = null;
 
     el.startOverlay.style.display = 'none';
     el.hud.style.display = 'block';
@@ -138,6 +139,18 @@ export async function startAR(ctx) {
 
     if (session.enabledFeatures?.includes('depth-sensing')) {
       console.info('[Depth] feature enabled, usage:', session.depthUsage, 'format:', session.preferredDepthFormat);
+      // renderer.xr.getBinding() は使わず、この時点(setSession完了後、
+      // = renderer.getContext() が XR compatible になった後) に
+      // 自前で XRWebGLBinding を生成する。Chrome 150 では
+      // getBinding() のキャッシュ管理が絡んで depth 情報が
+      // 取得できない/オクルージョンが効かないケースがあったため。
+      try {
+        const gl = ctx.renderer.getContext();
+        ctx.xrGlBinding = new XRWebGLBinding(session, gl);
+      } catch (e) {
+        console.warn('[Depth] XRWebGLBinding の生成に失敗しました:', e.message);
+        ctx.showError('Depth API の初期化に失敗しました(物理のみ動作)');
+      }
     } else {
       console.warn('[Depth] depth-sensing not in enabledFeatures — occlusion disabled');
       ctx.showError('この端末/ブラウザでは Depth API が無効です(物理のみ動作)');
@@ -166,9 +179,9 @@ export function onSessionEnd(ctx) {
   if (ctx.depthState) {
     ctx.depthState.enabled = false;
     ctx.depthState.notified = false;
-    ctx.depthState.lastGlTex = null;
-    ctx.depthState.threeDepthTexture = null;
+    ctx.depthState.depthTextureWrapper = null;
   }
+  ctx.xrGlBinding = null;
   el.hud.style.display = 'none';
   el.startOverlay.style.display = 'flex';
   el.startBtn.disabled = false;
@@ -280,7 +293,7 @@ export function onXRFrame(ctx, timestamp, frame) {
   const dt = clockDelta();
 
   // --- GPU Depth Occlusion ---
-  const depthOk = updateDepthOcclusion(state.session, renderer, frame, refSpace, ctx.depthState, ctx.placedObjects);
+  const depthOk = updateDepthOcclusion(state.session, renderer, ctx.xrGlBinding, frame, refSpace, ctx.depthState, ctx.placedObjects);
   if (depthOk && !ctx.depthState.notified) {
     ctx.depthState.enabled = true;
     ctx.depthState.notified = true;
