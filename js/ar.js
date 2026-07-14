@@ -3,13 +3,21 @@
    WebAR セッション管理 / Hit-Test / フレームループ
    ------------------------------------------------------------
    Pixel 7a + Chrome 150 向け修正点:
+   ・requestSession() は1クリックにつき必ず1回だけ呼ぶ
+     (以前は depth-sensing required → optional → なし、の3段階で
+      同じクリック内に最大3回 requestSession() を呼んでいたが、
+      requestSession() は呼んだ瞬間に transient user activation を
+      消費する仕様のため、1回目が(許可プロンプトが出る前に)
+      即 reject されると2回目以降は SecurityError で確実に失敗するだけ
+      だった。これが「ARを開始を押してもカメラ画面に遷移しない」の
+      直接の原因だったため、1回の requestSession() で
+      depth-sensing を optionalFeatures として要求する構成に統一した)
    ・requestSession() にタイムアウトを設けた
      (許可プロンプトが出ないまま Promise が無期限 pending になる
-      既知の挙動があり、それが「ボタンを押しても完全に無反応」に
-      見える最大の原因だったため)
+      既知の挙動があり、それも「ボタンを押しても無反応」に見える
+      原因になり得るため)
    ・クリック直後に即座にボタンの見た目を変える
      (体感的な "無反応" をなくす)
-   ・depth-sensing を全く要求しない設定も含めた3段階フォールバック
    ・エラーを showError (自動で消える) だけでなく console.error にも
      必ず出し、致命的な場合は本当にAR非対応と誤認させないよう
      区別して案内する
@@ -31,66 +39,52 @@ function withTimeout(promise, ms, message) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-/* depth-sensing を required で試行 → optional → 完全に要求しない、の3段階
-   でフォールバックする。Chrome 150 では 'luminance-alpha' の
-   dataFormatPreference が特定端末で requestSession 自体を拒否させる
-   ケースが報告されているため、depth を一切求めない構成も用意する。 */
-function buildSessionConfigs() {
-  return [
-    {
-      label: 'hit-test + depth-sensing(必須)',
-      config: {
-        requiredFeatures: ['hit-test', 'depth-sensing'],
-        optionalFeatures: ['dom-overlay'],
-        depthSensing: {
-          usagePreference: ['gpu-optimized'],
-          dataFormatPreference: ['luminance-alpha'],
-        },
-        domOverlay: { root: document.body },
-      },
+/* 重要: navigator.xr.requestSession() は Fullscreen API などと同じ
+   "activation-consuming API" で、呼び出した瞬間にそのクリック(タップ)の
+   transient user activation を消費する。これは呼び出しが成功しても
+   失敗しても関係なく消費される。
+   そのため「1回目は depth-sensing を required で試す → 失敗したら
+   2回目・3回目を同じクリック内で呼んでフォールバックする」という
+   多段リトライは、1回目が(許可プロンプトが出る前に) NotSupportedError
+   等で即 reject された場合、2回目以降は user activation が
+   残っておらず SecurityError で即座に失敗するだけになる。
+   これが「ARを開始を押してもカメラ画面に遷移しない」の実体だった。
+   → 1クリックにつき requestSession() は必ず1回だけ呼ぶ。
+   depth-sensing は最初から optionalFeatures にしておき、ARCore が
+   提供できなければ黙って外れるだけで hit-test セッション自体は
+   成立するようにする(depth を requiredFeatures に入れて全体を
+   道連れにしない)。 */
+function buildSessionConfig() {
+  return {
+    requiredFeatures: ['hit-test'],
+    optionalFeatures: ['dom-overlay', 'depth-sensing'],
+    depthSensing: {
+      usagePreference: ['gpu-optimized'],
+      dataFormatPreference: ['luminance-alpha', 'float32'],
     },
-    {
-      label: 'hit-test(必須) + depth-sensing(任意)',
-      config: {
-        requiredFeatures: ['hit-test'],
-        optionalFeatures: ['dom-overlay', 'depth-sensing'],
-        depthSensing: {
-          usagePreference: ['gpu-optimized'],
-          dataFormatPreference: ['luminance-alpha', 'float32'],
-        },
-        domOverlay: { root: document.body },
-      },
-    },
-    {
-      label: 'hit-testのみ(depth-sensingなし)',
-      config: {
-        requiredFeatures: ['hit-test'],
-        optionalFeatures: ['dom-overlay'],
-        domOverlay: { root: document.body },
-      },
-    },
-  ];
+    domOverlay: { root: document.body },
+  };
 }
 
 export async function requestARSession(navigatorXr) {
-  const attempts = buildSessionConfigs();
-  let lastErr;
-  for (const { label, config } of attempts) {
-    try {
-      console.info('[AR] requestSession attempt:', label);
-      const session = await withTimeout(
-        navigatorXr.requestSession('immersive-ar', config),
-        SESSION_REQUEST_TIMEOUT_MS,
-        `ARセッションの許可プロンプトがタイムアウトしました(${label})。Chromeのカメラ/AR権限設定をご確認ください。`
-      );
-      console.info('[AR] session started with config:', label);
-      return session;
-    } catch (e) {
-      lastErr = e;
-      console.warn('[AR] config failed:', label, '-', e.message);
-    }
+  const config = buildSessionConfig();
+  try {
+    console.info('[AR] requestSession (single attempt, depth-sensing optional)');
+    const session = await withTimeout(
+      navigatorXr.requestSession('immersive-ar', config),
+      SESSION_REQUEST_TIMEOUT_MS,
+      'ARセッションの許可プロンプトがタイムアウトしました。Chromeのカメラ/AR権限設定をご確認ください。'
+    );
+    console.info('[AR] session started. enabledFeatures:', session.enabledFeatures);
+    return session;
+  } catch (e) {
+    console.warn('[AR] requestSession failed:', e.name, '-', e.message);
+    // dom-overlay 込みの要求自体が原因で reject されるごく一部の端末向けに、
+    // "次のタップ" で再挑戦できるよう、ここでは同一クリック内で
+    // 再度 requestSession() を呼ばずにそのままエラーを投げる
+    // (呼んでも user activation が無いので必ず SecurityError になるだけ)。
+    throw e;
   }
-  throw lastErr || new Error('ARセッションを開始できませんでした');
 }
 
 /**
