@@ -86,7 +86,15 @@ export function updateDepthOcclusion(session, renderer, binding, frame, refSpace
       console.warn('[Depth] getDepthInformation failed:', e.message);
       return false;
     }
-    if (!depthInfo || !depthInfo.isValid || !depthInfo.texture) continue;
+    // 重要: XRWebGLDepthInformation に `isValid` というプロパティは
+    // 存在しない (仕様上は width/height/normDepthBufferFromNormView/
+    // rawValueToMeters/texture のみ)。存在しないプロパティへの
+    // アクセスは例外を投げず undefined を返すため、以前ここで
+    // `!depthInfo.isValid` を条件に入れていたコードは常に true 評価され、
+    // getDepthInformation() が有効なテクスチャを返していても
+    // 毎フレーム必ず continue されてしまい、オクルージョン処理
+    // (テクスチャ注入・uniform適用)に一切到達できなかった。
+    if (!depthInfo || !depthInfo.texture) continue;
 
     const wrapperTex = ensureWrapperTexture(depthState);
     // 毎フレーム直接差し込む(端末によっては同じ参照でも中身が
