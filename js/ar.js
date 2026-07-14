@@ -135,10 +135,20 @@ export async function startAR(ctx) {
     const viewerSpace = await session.requestReferenceSpace('viewer');
     state.hitTestSource = await session.requestHitTestSource({ space: viewerSpace });
 
-    ctx.depthState.isFloatFormat = session.preferredDepthFormat === 'float32';
-
+    // 重要: XRSession のプロパティは `preferredDepthFormat` ではなく
+    // 仕様上 `depthDataFormat` が正しい名前 (W3C WebXR Depth Sensing Module /
+    // MDN XRSession.depthDataFormat 準拠)。存在しないプロパティへの
+    // アクセスは常に undefined を返すため例外にはならず、この綴り間違いは
+    // 「isFloatFormat が常に false のまま」という形で静かに残ってしまい、
+    // luminance-alpha 以外(float32)が選択された端末ではシェーダーが
+    // 誤ったパッキング解釈で深度をサンプリングし続け、
+    // オクルージョンが無効/破綻して見える原因になっていた。
+    // また `depthDataFormat` は depth-sensing が有効でないセッションで
+    // 参照すると InvalidStateError を投げる仕様のため、
+    // enabledFeatures の確認より前で読んではいけない。
     if (session.enabledFeatures?.includes('depth-sensing')) {
-      console.info('[Depth] feature enabled, usage:', session.depthUsage, 'format:', session.preferredDepthFormat);
+      ctx.depthState.isFloatFormat = session.depthDataFormat === 'float32';
+      console.info('[Depth] feature enabled, usage:', session.depthUsage, 'format:', session.depthDataFormat);
       // renderer.xr.getBinding() は使わず、この時点(setSession完了後、
       // = renderer.getContext() が XR compatible になった後) に
       // 自前で XRWebGLBinding を生成する。Chrome 150 では
