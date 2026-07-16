@@ -1,0 +1,237 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>8th Wall x three.js — アニメーション + オクルージョン サンプル</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #000; }
+    #camerafeed { position: absolute; top: 0; left: 0; }
+
+    #ui {
+      position: absolute; z-index: 10; left: 0; right: 0; bottom: 24px;
+      display: flex; justify-content: center; gap: 12px;
+      font-family: -apple-system, "Helvetica Neue", sans-serif;
+    }
+    #ui button {
+      padding: 10px 18px; border: none; border-radius: 24px;
+      background: rgba(20,20,20,0.75); color: #fff; font-size: 14px;
+      backdrop-filter: blur(4px);
+    }
+    #ui button.active { background: #2ec7ff; color: #001018; font-weight: 600; }
+
+    #hint {
+      position: absolute; z-index: 10; top: 24px; left: 0; right: 0;
+      text-align: center; color: #fff; font-family: sans-serif; font-size: 14px;
+      text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+    }
+  </style>
+
+  <!-- three.js r160系。8th Wallの XR8.Threejs.pipelineModule() は内部で
+       グローバルの THREE を参照するため、必ずこの後に読み込む -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r160/three.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r160/loaders/GLTFLoader.js"></script>
+
+  <!-- XRExtras: ローディング画面・エラーハンドリングなどのユーティリティ
+       (github.com/8thwall/8thwall 内、旧 8thwall/web/xrextras の後継)。
+       ここは MIT ライセンスのオープンソース部分。 -->
+  <script src="https://cdn.8thwall.com/web/xrextras/xrextras.js"></script>
+
+  <!--
+    8th Wall Engine 本体(SLAM/VPSを含む配布バイナリ)。
+    ホスティング型プラットフォーム終了(2026/2/28)に伴い、新規プロジェクトは
+    apps.8thwall.com?appKey=... ではなく、engineバイナリを自前ホストする形式が推奨されています。
+    https://github.com/8thwall/engine から xr.js 一式を取得し、
+    自分のドメイン配下 (例: /external/xr/xr.js) に配置してください。
+    SLAM自体はプロプライエタリ(Niantic Spatial)ですが、無料利用が可能です。
+  -->
+  <script crossorigin="anonymous" src="./external/xr/xr.js" data-preload-chunks="slam"></script>
+</head>
+<body>
+  <canvas id="camerafeed"></canvas>
+  <div id="hint">床をタップしてモデルを配置</div>
+  <div id="ui">
+    <button id="btn-occlusion" class="active">オクルージョン: ON</button>
+    <button id="btn-anim">アニメーション: 再生中</button>
+  </div>
+
+  <script>
+  (() => {
+    'use strict';
+
+    const MODEL_URL = './assets/animated_model.glb'; // アニメーション付きglTF/GLBに差し替えてください
+
+    let mixer = null;          // AnimationMixerの参照
+    let modelRoot = null;      // ロードしたモデルのルート
+    let occluderMesh = null;   // 仮想オクルーダー(床面)
+    let placed = false;
+    let occlusionEnabled = true;
+    let animPlaying = true;
+    const clock = new THREE.Clock();
+
+    // ------------------------------------------------------------------
+    // 仮想オクルーダーを作る。
+    //
+    // 8th Wallのオープンソース部分だけでは、実世界の深度メッシュ(VPS)は
+    // 使えないため「本物の環境オクルージョン」は組めません。代わりに、
+    // タップした床の高さに「色は書かず深度だけ書き込む」平面を敷き、
+    // その平面より奥にあるモデルの部分を隠す、という近似トリックで
+    // "床の向こう側に沈んでいるように見える" 表現を作ります。
+    //
+    // colorWrite:false + depthWrite:true が肝です。
+    // renderOrder をモデルより先に設定し、先にこの平面だけ深度バッファに
+    // 書き込んでから、モデルを通常描画させます。
+    // ------------------------------------------------------------------
+    function createOccluder() {
+      const geometry = new THREE.PlaneGeometry(4, 4)
+      const material = new THREE.MeshBasicMaterial({
+        colorWrite: false,   // 色は書かない = 見えないが
+        depthWrite: true,    // 深度は書く = 奥のものを隠せる
+      })
+      const mesh = new THREE.Mesh(geometry, material)
+      mesh.rotation.x = -Math.PI / 2
+      mesh.renderOrder = -1 // モデルより先に描画してZバッファに深度を仕込む
+      mesh.visible = occlusionEnabled
+      return mesh
+    }
+
+    function loadAnimatedModel(scene, onLoaded) {
+      const loader = new THREE.GLTFLoader()
+      loader.load(
+        MODEL_URL,
+        (gltf) => {
+          modelRoot = gltf.scene
+          modelRoot.scale.setScalar(0.5)
+          modelRoot.renderOrder = 0 // オクルーダー(-1)の後に描画される
+          scene.add(modelRoot)
+
+          if (gltf.animations && gltf.animations.length > 0) {
+            mixer = new THREE.AnimationMixer(modelRoot)
+            const action = mixer.clipAction(gltf.animations[0])
+            action.play()
+          }
+
+          if (onLoaded) onLoaded(modelRoot)
+        },
+        undefined,
+        (err) => console.error('glTF読み込みエラー:', err)
+      )
+    }
+
+    // タップした位置のヒットテスト結果でモデル/オクルーダーを配置
+    function placeAtHit(hitResult, scene) {
+      const { position, rotation } = hitResult
+
+      if (!occluderMesh) {
+        occluderMesh = createOccluder()
+        scene.add(occluderMesh)
+      }
+      occluderMesh.position.set(position.x, position.y, position.z)
+
+      if (!modelRoot) {
+        loadAnimatedModel(scene, (root) => {
+          root.position.set(position.x, position.y, position.z)
+        })
+      } else {
+        modelRoot.position.set(position.x, position.y, position.z)
+      }
+
+      placed = true
+      document.getElementById('hint').style.display = 'none'
+    }
+
+    // ------------------------------------------------------------------
+    // メインのカメラパイプラインモジュール
+    // ------------------------------------------------------------------
+    const mainPipelineModule = () => ({
+      name: 'animated-occlusion-sample',
+
+      onStart: ({ canvas }) => {
+        const { scene, camera, renderer } = XR8.Threejs.xrScene()
+
+        // ライティング
+        scene.add(new THREE.AmbientLight(0xffffff, 0.9))
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.6)
+        dirLight.position.set(1, 3, 1)
+        scene.add(dirLight)
+
+        // world trackingの原点をカメラに同期
+        XR8.XrController.updateCameraProjectionMatrix({
+          origin: camera.position,
+          facing: camera.quaternion,
+        })
+
+        // タップで床にヒットテスト → 配置
+        canvas.addEventListener('touchstart', (e) => {
+          if (e.touches.length !== 1) return
+          const touch = e.touches[0]
+
+          const hits = XR8.XrController.hitTest(
+            touch.clientX / canvas.clientWidth,
+            touch.clientY / canvas.clientHeight,
+            ['FEATURE_POINT', 'ESTIMATED_SURFACE']
+          )
+
+          if (hits.length) {
+            placeAtHit(hits[0], scene)
+          }
+        })
+      },
+
+      onUpdate: () => {
+        if (mixer && animPlaying) {
+          mixer.update(clock.getDelta())
+        } else {
+          clock.getDelta() // 一時停止中もdelta蓄積させない
+        }
+      },
+    })
+
+    // ------------------------------------------------------------------
+    // UIボタン
+    // ------------------------------------------------------------------
+    function setupUI() {
+      const occBtn = document.getElementById('btn-occlusion')
+      occBtn.addEventListener('click', () => {
+        occlusionEnabled = !occlusionEnabled
+        if (occluderMesh) occluderMesh.visible = occlusionEnabled
+        occBtn.textContent = `オクルージョン: ${occlusionEnabled ? 'ON' : 'OFF'}`
+        occBtn.classList.toggle('active', occlusionEnabled)
+      })
+
+      const animBtn = document.getElementById('btn-anim')
+      animBtn.addEventListener('click', () => {
+        animPlaying = !animPlaying
+        animBtn.textContent = `アニメーション: ${animPlaying ? '再生中' : '一時停止'}`
+        animBtn.classList.toggle('active', animPlaying)
+      })
+    }
+
+    // ------------------------------------------------------------------
+    // 起動処理
+    // ------------------------------------------------------------------
+    const onxrloaded = () => {
+      XR8.addCameraPipelineModules([
+        XR8.GlTextureRenderer.pipelineModule(),   // カメラ映像を描画
+        XR8.Threejs.pipelineModule(),             // three.jsシーン/カメラ/レンダラーを構築
+        XR8.XrController.pipelineModule(),        // 6DoF SLAMトラッキングを有効化
+        XRExtras.AlmostThere.pipelineModule(),    // 非対応環境向けの案内
+        XRExtras.FullWindowCanvas.pipelineModule(),
+        XRExtras.Loading.pipelineModule(),        // ローディング画面
+        XRExtras.RuntimeError.pipelineModule(),   // 実行時エラー表示
+        mainPipelineModule(),
+      ])
+
+      XR8.run({ canvas: document.getElementById('camerafeed') })
+      setupUI()
+    }
+
+    window.onload = () => {
+      window.XRExtras
+        ? XRExtras.Loading.showLoading({ onxrloaded })
+        : window.addEventListener('xrextrasloaded', () => XRExtras.Loading.showLoading({ onxrloaded }))
+    }
+  })()
+  </script>
+</body>
+</html>
